@@ -16,6 +16,7 @@
 (define-constant ERR-ALREADY-CLAIMED (err u111))
 (define-constant ERR-BLACKLISTED (err u112))
 (define-constant ERR-NOT-FOUND (err u113))
+(define-constant ERR-TRANSFER-FAILED (err u114))
 
 ;; Data variables
 (define-data-var initialized bool false)
@@ -24,6 +25,7 @@
 (define-data-var distribution-id uint u0)
 (define-data-var total-distributed uint u0)
 (define-data-var minimum-stake uint u1000000) ;; 1 STX by default (in microSTX)
+(define-data-var total-percentage uint u0) ;; Keep track of total percentage allocated (in basis points)
 
 ;; Maps for contract state
 (define-map stakeholders principal { percentage: uint })
@@ -70,10 +72,14 @@
   (var-get distribution-id)
 )
 
+(define-read-only (get-total-percentage)
+  (var-get total-percentage)
+)
+
 (define-read-only (get-claimable-amount (id uint) (stakeholder principal))
   (let (
     (distribution (map-get? distributions id))
-    (stake (get stake stakeholder))
+    (stake (get-stake stakeholder))
   )
     (if (and (is-some distribution) (> (get percentage stake) u0))
       (let (
@@ -157,31 +163,23 @@
 
 ;; Register a new stakeholder with a percentage (in basis points, 10000 = 100%)
 (define-public (register-stakeholder (stakeholder principal) (percentage uint))
-  (let (
-    (current-percentage (fold + (map get-percentage (map-keys stakeholders)) u0))
-  )
-    (begin
-      (try! (check-owner))
-      (try! (check-initialized))
-      (try! (check-distribution-inactive))
-      (try! (validate-percentage percentage))
-      
-      ;; Check that adding this percentage doesn't exceed 100%
-      (if (> (+ current-percentage percentage) u10000)
-        (err ERR-PERCENTAGE-SUM-EXCEEDED)
-        (begin
-          (map-set stakeholders stakeholder { percentage: percentage })
-          (map-set stakeholder-balances stakeholder u0)
-          (ok true)
-        )
+  (begin
+    (try! (check-owner))
+    (try! (check-initialized))
+    (try! (check-distribution-inactive))
+    (try! (validate-percentage percentage))
+    
+    ;; Check that adding this percentage doesn't exceed 100%
+    (if (> (+ (var-get total-percentage) percentage) u10000)
+      (err ERR-PERCENTAGE-SUM-EXCEEDED)
+      (begin
+        (map-set stakeholders stakeholder { percentage: percentage })
+        (map-set stakeholder-balances stakeholder u0)
+        (var-set total-percentage (+ (var-get total-percentage) percentage))
+        (ok true)
       )
     )
   )
-)
-
-;; Private helper to get the percentage from a principal
-(define-private (get-percentage (stakeholder principal))
-  (get percentage (default-to { percentage: u0 } (map-get? stakeholders stakeholder)))
 )
 
 ;; Update a stakeholder's percentage
@@ -189,7 +187,6 @@
   (let (
     (current-stake (get-stake stakeholder))
     (old-percentage (get percentage current-stake))
-    (current-total-percentage (fold + (map get-percentage (map-keys stakeholders)) u0))
   )
     (begin
       (try! (check-owner))
@@ -198,10 +195,11 @@
       (try! (validate-percentage percentage))
       
       ;; Check that the percentage change doesn't exceed 100%
-      (if (> (+ (- current-total-percentage old-percentage) percentage) u10000)
+      (if (> (+ (- (var-get total-percentage) old-percentage) percentage) u10000)
         (err ERR-PERCENTAGE-SUM-EXCEEDED)
         (begin
           (map-set stakeholders stakeholder { percentage: percentage })
+          (var-set total-percentage (+ (- (var-get total-percentage) old-percentage) percentage))
           (ok true)
         )
       )
@@ -211,14 +209,22 @@
 
 ;; Remove a stakeholder
 (define-public (remove-stakeholder (stakeholder principal))
-  (begin
-    (try! (check-owner))
-    (try! (check-initialized))
-    (try! (check-distribution-inactive))
-    
-    (if (map-delete stakeholders stakeholder)
-      (ok true)
-      (err ERR-NOT-FOUND)
+  (let (
+    (current-stake (get-stake stakeholder))
+    (percentage (get percentage current-stake))
+  )
+    (begin
+      (try! (check-owner))
+      (try! (check-initialized))
+      (try! (check-distribution-inactive))
+      
+      (if (map-delete stakeholders stakeholder)
+        (begin
+          (var-set total-percentage (- (var-get total-percentage) percentage))
+          (ok true)
+        )
+        (err ERR-NOT-FOUND)
+      )
     )
   )
 )
@@ -280,10 +286,12 @@
       
       (if (<= amount u0)
         (err ERR-ZERO-AMOUNT)
-        (begin
-          (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-          (var-set total-contributions (+ (var-get total-contributions) amount))
-          (ok amount)
+        (match (stx-transfer? amount tx-sender (as-contract tx-sender))
+          success (begin
+            (var-set total-contributions (+ (var-get total-contributions) amount))
+            (ok amount)
+          )
+          error (err ERR-TRANSFER-FAILED)
         )
       )
     )
@@ -298,10 +306,12 @@
     
     (if (<= amount u0)
       (err ERR-ZERO-AMOUNT)
-      (begin
-        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-        (var-set total-contributions (+ (var-get total-contributions) amount))
-        (ok amount)
+      (match (stx-transfer? amount tx-sender (as-contract tx-sender))
+        success (begin
+          (var-set total-contributions (+ (var-get total-contributions) amount))
+          (ok amount)
+        )
+        error (err ERR-TRANSFER-FAILED)
       )
     )
   )
@@ -341,11 +351,11 @@
 )
 
 ;; Claim profits for a specific distribution
-(define-public (claim-profits (distribution-id uint))
+(define-public (claim-profits (dist-id uint))
   (let (
-    (distribution (map-get? distributions distribution-id))
+    (distribution (map-get? distributions dist-id))
     (stake (get-stake tx-sender))
-    (claimed-already (is-claimed distribution-id tx-sender))
+    (claimed-already (is-claimed dist-id tx-sender))
   )
     (begin
       (try! (check-initialized))
@@ -362,13 +372,16 @@
       )
         (begin
           ;; Mark as claimed to prevent double-claiming
-          (map-set claimed { distribution-id: distribution-id, stakeholder: tx-sender } true)
+          (map-set claimed { distribution-id: dist-id, stakeholder: tx-sender } true)
           
           ;; Update stakeholder balance
           (map-set stakeholder-balances tx-sender (+ (get-stakeholder-balance tx-sender) amount-to-claim))
           
           ;; Transfer the claimed amount
-          (as-contract (stx-transfer? amount-to-claim tx-sender tx-sender))
+          (match (as-contract (stx-transfer? amount-to-claim tx-sender tx-sender))
+            success (ok amount-to-claim)
+            error (err ERR-TRANSFER-FAILED)
+          )
         )
       )
     )
@@ -385,9 +398,9 @@
       
       (if (<= balance u0)
         (err ERR-INSUFFICIENT-BALANCE)
-        (begin
-          (as-contract (stx-transfer? balance tx-sender CONTRACT-OWNER))
-          (ok balance)
+        (match (as-contract (stx-transfer? balance tx-sender CONTRACT-OWNER))
+          success (ok balance)
+          error (err ERR-TRANSFER-FAILED)
         )
       )
     )
@@ -404,6 +417,7 @@
     current-distribution-id: (var-get distribution-id),
     total-distributed: (var-get total-distributed),
     minimum-stake: (var-get minimum-stake),
+    total-percentage: (var-get total-percentage),
     contract-balance: (stx-get-balance (as-contract tx-sender))
   }
 )
